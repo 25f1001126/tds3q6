@@ -1,11 +1,8 @@
 import base64
 import io
-import tempfile
-import os
-import json
-
 import numpy as np
 import pandas as pd
+import soundfile as sf
 import librosa
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,30 +23,29 @@ class AudioRequest(BaseModel):
     audio_base64: str
 
 
-def decode_audio_to_wav(audio_base64: str) -> str:
-    """Decode a base64 audio string and save it as a temp WAV file, return path."""
-    # Strip data URL prefix if present (e.g. "data:audio/wav;base64,...")
+def decode_audio(audio_base64: str):
+    """Decode base64 -> numpy array directly in memory (no temp file, no ffmpeg)."""
     if "," in audio_base64 and audio_base64.strip().startswith("data:"):
         audio_base64 = audio_base64.split(",", 1)[1]
 
     audio_bytes = base64.b64decode(audio_base64)
+    buf = io.BytesIO(audio_bytes)
 
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-    tmp.write(audio_bytes)
-    tmp.close()
-    return tmp.name
+    # soundfile reads WAV/FLAC natively and fast, no subprocess needed
+    y, sr = sf.read(buf, dtype="float32", always_2d=False)
+    if y.ndim > 1:
+        y = y.mean(axis=1)  # mono
+    return y, sr
 
 
-def extract_feature_dataframe(wav_path: str, frame_length: int = 2048, hop_length: int = 512) -> pd.DataFrame:
-    """Load audio and extract per-frame features into a DataFrame."""
-    y, sr = librosa.load(wav_path, sr=None, mono=True)
-
-    rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
-    zcr = librosa.feature.zero_crossing_rate(y, frame_length=frame_length, hop_length=hop_length)[0]
+def extract_feature_dataframe(y: np.ndarray, sr: int, hop_length: int = 1024) -> pd.DataFrame:
+    """Lighter feature set: bigger hop_length + fewer MFCCs = far fewer FFT calls."""
+    rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
+    zcr = librosa.feature.zero_crossing_rate(y, hop_length=hop_length)[0]
     centroid = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=hop_length)[0]
     bandwidth = librosa.feature.spectral_bandwidth(y=y, sr=sr, hop_length=hop_length)[0]
     rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr, hop_length=hop_length)[0]
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13, hop_length=hop_length)
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=8, hop_length=hop_length)  # fewer coeffs
 
     n_frames = min(len(rms), len(zcr), len(centroid), len(bandwidth), len(rolloff), mfcc.shape[1])
 
@@ -60,7 +56,7 @@ def extract_feature_dataframe(wav_path: str, frame_length: int = 2048, hop_lengt
         "spectral_bandwidth": bandwidth[:n_frames],
         "spectral_rolloff": rolloff[:n_frames],
     }
-    for i in range(13):
+    for i in range(8):
         data[f"mfcc_{i+1}"] = mfcc[i][:n_frames]
 
     return pd.DataFrame(data)
@@ -82,7 +78,7 @@ def dataframe_stats(df: pd.DataFrame) -> dict:
     mode = {col: series_mode(numeric_df[col]) for col in numeric_df.columns}
     rng = maximum - minimum
 
-    result = {
+    return {
         "rows": int(numeric_df.shape[0]),
         "columns": list(numeric_df.columns),
         "mean": {k: float(v) for k, v in mean.to_dict().items()},
@@ -93,13 +89,12 @@ def dataframe_stats(df: pd.DataFrame) -> dict:
         "median": {k: float(v) for k, v in median.to_dict().items()},
         "mode": mode,
         "range": {k: float(v) for k, v in rng.to_dict().items()},
-        "allowed_values": {},  # continuous features -> no fixed categorical set
+        "allowed_values": {},
         "value_range": {
             col: [float(minimum[col]), float(maximum[col])] for col in numeric_df.columns
         },
         "correlation": numeric_df.corr().fillna(0).values.tolist(),
     }
-    return result
 
 
 @app.get("/")
@@ -109,16 +104,13 @@ def root():
 
 @app.post("/analyze")
 def analyze(req: AudioRequest):
-    wav_path = None
     try:
-        wav_path = decode_audio_to_wav(req.audio_base64)
-        df = extract_feature_dataframe(wav_path)
+        y, sr = decode_audio(req.audio_base64)
+        df = extract_feature_dataframe(y, sr)
         if df.empty:
             raise HTTPException(status_code=400, detail="No audio frames extracted")
-        stats = dataframe_stats(df)
-        return stats
+        return dataframe_stats(df)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to process audio: {e}")
-    finally:
-        if wav_path and os.path.exists(wav_path):
-            os.remove(wav_path)
